@@ -5,12 +5,16 @@ import subprocess
 
 
 def clear_terminal() -> None:
-    """Clear the terminal screen based on the operating system."""
-    commands = {
-        "nt": "cls",       # Windows
-        "posix": "clear",  # macOS and Linux
-    }
+"""Clear the terminal screen when a terminal is available."""
+if not os.environ.get("TERM") and os.name != "nt":
+return
 
-    command = commands.get(os.name)
-    if command:
-        subprocess.run(command, shell=True, check=True)  # noqa: S603
+commands = {
+    "nt": "cls",
+    "posix": "clear",
+}
+
+command = commands.get(os.name)
+
+if command:
+    subprocess.run(command, shell=True, check=False)  # noqa: S603

@@ -1,8 +1,11 @@
-"""Downloader module for downloading files from GoFile.
+"""GoFile command-line downloader.
 
-Example usage:
-    python3 gofile_downloader.py <album_url>
-    python3 gofile_downloader.py <album_url> <password>
+This module intentionally contains no GUI/live-terminal UI so it works in:
+- Termux
+- Linux
+- GitHub Actions
+- Docker/CI
+- SSH/headless environments
 """
 
 from __future__ import annotations
@@ -11,9 +14,9 @@ import hashlib
 import logging
 import os
 import sys
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import requests
 
@@ -28,7 +31,6 @@ from src.config import (
 )
 from src.download_utils import save_file_with_progress
 from src.file_utils import create_download_directory
-from src.general_utils import clear_terminal
 from src.gofile_utils import (
     check_response_status,
     generate_content_url,
@@ -36,81 +38,77 @@ from src.gofile_utils import (
     get_account_token,
     get_content_id,
 )
-from src.managers.live_manager import LiveManager, initialize_managers
 
-if TYPE_CHECKING:
-    from argparse import Namespace
-
+LOGGER = logging.getLogger(__name__)
 DEFAULT_DOWNLOAD_PATH = Path.cwd() / DOWNLOAD_FOLDER
 
 
 class Downloader:
-    """Class to handle downloading files from a specified URL in parallel.
+    """Download GoFile content using plain CLI output only."""
 
-    It manages the download process, including handling authentication, partial
-    downloads, and error checking. This class supports resuming interrupted downloads,
-    verifying file integrity, and organizing downloads into appropriate directories.
-    """
-
-    def __init__(
-        self,
-        url: str,
-        live_manager: LiveManager,
-        args: Namespace | None = None,
-    ) -> None:
-        """Initialize the downloader with the given parameters."""
+    def __init__(self, url: str, args: Namespace | None = None) -> None:
         self.url = url
-        self.live_manager = live_manager
-        self.password = args.password if "password" in args else None
+        self.password = getattr(args, "password", None) if args else None
         self.max_workers = MAX_WORKERS
         self.token = get_account_token()
 
+        custom_path = getattr(args, "custom_path", None) if args else None
         self.download_path = (
-            Path(args.custom_path)
-            if args.custom_path is not None
-            else DEFAULT_DOWNLOAD_PATH
+            Path(custom_path) if custom_path else DEFAULT_DOWNLOAD_PATH
         )
         self.download_path.mkdir(parents=True, exist_ok=True)
         os.chdir(self.download_path)
 
-    def download_item(self, current_task: int, file_info: tuple) -> None:
-        """Download a single file."""
+    def download_item(self, current_task: int, file_info: dict) -> None:
+        """Download one file and report progress using normal log lines."""
         filename = file_info["filename"]
         final_path = Path(file_info["download_path"]) / filename
         download_link = file_info["download_link"]
 
-        # Skip file if it already exists and is not empty
-        if Path(final_path).exists():
-            self.live_manager.update_log(
-                event="Skipped download",
-                details=f"{filename} has already been downloaded.",
-            )
+        if final_path.exists() and final_path.stat().st_size > 0:
+            LOGGER.info("[SKIP] %s (already exists)", filename)
             return
 
-        headers = self._prepare_headers(url=download_link)
+        LOGGER.info("[START %d] %s", current_task + 1, filename)
 
-        # Perform the download and handle possible errors
-        with requests.get(
-            download_link,
-            headers=headers,
-            stream=True,
-            timeout=(10, 30),
-        ) as response:
-            if not check_response_status(response, filename):
-                return
+        try:
+            headers = self._prepare_headers(url=download_link)
 
-            task_id = self.live_manager.add_task(current_task=current_task)
-            save_file_with_progress(response, final_path, task_id, self.live_manager)
+            with requests.get(
+                download_link,
+                headers=headers,
+                stream=True,
+                timeout=(10, 30),
+            ) as response:
+                if not check_response_status(response, filename):
+                    LOGGER.error("[FAIL] %s: HTTP %s", filename, response.status_code)
+                    return
 
-    def run_in_parallel(self, content_directory: str, files_info: tuple) -> None:
-        """Execute the file downloads in parallel."""
+                save_file_with_progress(response, final_path, current_task, self.max_workers)
+
+            LOGGER.info("[DONE] %s", filename)
+
+        except requests.RequestException as exc:
+            LOGGER.error("[FAIL] %s: %s", filename, exc)
+        except OSError as exc:
+            LOGGER.error("[FAIL] %s: %s", filename, exc)
+
+    def run_in_parallel(self, content_directory: str, files_info: list[dict]) -> None:
+        """Execute downloads in parallel."""
+        previous_cwd = Path.cwd()
         os.chdir(content_directory)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for current_task, item_info in enumerate(files_info):
-                executor.submit(self.download_item, current_task, item_info)
-
-        os.chdir(self.download_path)
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = [
+                    executor.submit(self.download_item, current_task, item_info)
+                    for current_task, item_info in enumerate(files_info)
+                ]
+                # Retrieve exceptions raised by worker threads.
+                for future in futures:
+                    future.result()
+        finally:
+            os.chdir(previous_cwd)
 
     def _prepare_headers(
         self,
@@ -118,24 +116,18 @@ class Downloader:
         *,
         include_auth: bool = False,
     ) -> dict:
-        """Prepare the HTTP headers for the request."""
-        # Base headers common for all requests
-        headers = EXTENDED_HEADERS
+        """Prepare HTTP headers."""
+        headers = EXTENDED_HEADERS.copy()
 
-        # Add authentication headers if required
         if include_auth:
             headers["Authorization"] = f"Bearer {self.token}"
             headers["X-Website-Token"] = generate_website_token(self.token)
             headers["X-BL"] = LOCALE
-
         else:
-            # Add Referer and Origin headers if URL is provided
             if url:
                 adjusted_url = url + ("/" if not url.endswith("/") else "")
                 headers["Referer"] = adjusted_url
                 headers["Origin"] = url
-
-            # Add Cookie header when URL is not needed
             headers["Cookie"] = f"accountToken={self.token}"
 
         return headers
@@ -143,121 +135,122 @@ class Downloader:
     def parse_links(
         self,
         identifier: str,
-        files_info: tuple,
+        files_info: list[dict],
         password: str | None = None,
     ) -> None:
-        """Parse the URL for file links and populates a list with file information."""
+        """Resolve a GoFile URL into downloadable file entries."""
 
-        def append_file_info(files_info: tuple, data: dict) -> None:
+        def append_file_info(data: dict) -> None:
             files_info.append(
                 {
                     "download_path": str(Path.cwd()),
                     "filename": data["name"],
                     "download_link": data["link"],
-                },
+                }
             )
-
-        def check_password(data: dict) -> bool:
-            password_exists = "password" in data
-            password_status_ok = data.get("passwordStatus") == "passwordOk"
-            return password_exists and not password_status_ok
 
         content_url = generate_content_url(identifier, password=password)
         headers = self._prepare_headers(include_auth=True)
 
-        response = requests.get(content_url, headers=headers, timeout=10).json()
-        if response["status"] != "ok":
-            self.live_manager.update_log(
-                event="Failed request",
-                details=f"Failed to get a link as response from {content_url}.",
-            )
+        try:
+            response = requests.get(
+                content_url,
+                headers=headers,
+                timeout=10,
+            ).json()
+        except (requests.RequestException, ValueError) as exc:
+            LOGGER.error("[FAIL] Request error: %s", exc)
+            return
+
+        if response.get("status") != "ok":
+            LOGGER.error("[FAIL] Failed to get file information from GoFile.")
             return
 
         data = response["data"]
-        if check_password(data):
-            self.live_manager.update_log(
-                event="Missing password",
-                details="The URL requires a valid password. "
-                "Please provide one to proceed.",
+
+        password_exists = "password" in data
+        password_ok = data.get("passwordStatus") == "passwordOk"
+        if password_exists and not password_ok:
+            LOGGER.error(
+                "[FAIL] This URL requires a valid password. "
+                "Provide it as the second argument."
             )
             return
 
-        # Handle folder
         if data["type"] == "folder":
             create_download_directory(data["name"])
             os.chdir(data["name"])
-
-            for child_id in data["children"]:
-                child = data["children"][child_id]
-
-                if child["type"] == "folder":
-                    self.parse_links(child["id"], files_info, password)
-                else:
-                    append_file_info(files_info, child)
-
-            os.chdir(os.path.pardir)
-
-        # Handle file
+            try:
+                for child in data["children"].values():
+                    if child["type"] == "folder":
+                        self.parse_links(child["id"], files_info, password)
+                    else:
+                        append_file_info(child)
+            finally:
+                os.chdir(os.path.pardir)
         else:
-            append_file_info(files_info, data)
+            append_file_info(data)
 
     def initialize_download(self) -> None:
-        """Initialize the download process."""
+        """Resolve and download all files."""
         content_id = get_content_id(self.url)
         content_directory = self.download_path / content_id
         create_download_directory(content_directory)
 
-        files_info = []
+        files_info: list[dict] = []
         hashed_password = (
             hashlib.sha256(self.password.encode()).hexdigest()
             if self.password
-            else self.password
+            else None
         )
+
+        LOGGER.info("[INFO] URL: %s", self.url)
+        LOGGER.info("[INFO] Content ID: %s", content_id)
+
         self.parse_links(content_id, files_info, hashed_password)
 
-        # Remove the root content directory if there's no file or subdirectory.
         if not os.listdir(content_directory) and not files_info:
-            Path(content_directory).rmdir()
+            try:
+                content_directory.rmdir()
+            except OSError:
+                pass
             return
 
-        self.live_manager.add_overall_task(
-            description=content_id,
-            num_tasks=len(files_info),
-        )
-        self.run_in_parallel(content_directory, files_info)
+        LOGGER.info("[INFO] Found %d file(s)", len(files_info))
+        self.run_in_parallel(str(content_directory), files_info)
+        LOGGER.info("[INFO] Download process finished for %s", content_id)
 
 
 def handle_download_process(
     url: str,
-    live_manager: LiveManager,
     args: Namespace | None = None,
 ) -> None:
-    """Handle the process of downloading content from a specified URL."""
-    if url is None:
-        logging.error(
-            "Default usage: %s\nPassword usage: %s\n",
+    """Handle one URL."""
+    if not url:
+        LOGGER.error(
+            "Usage: %s\nPassword usage: %s",
             DEFAULT_USAGE,
             PASSWORD_USAGE,
         )
-        sys.exit(1)
+        raise SystemExit(1)
 
-    downloader = Downloader(url=url, live_manager=live_manager, args=args)
-    downloader.initialize_download()
+    Downloader(url=url, args=args).initialize_download()
 
 
 def main() -> None:
-    """Process command-line arguments to download an album from a specified URL."""
-    clear_terminal()
+    """CLI entry point for a single GoFile URL."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     args = parse_arguments()
-    live_manager = initialize_managers()
-
     try:
-        with live_manager.live:
-            handle_download_process(args.url, live_manager, args=args)
-            live_manager.stop()
-
+        handle_download_process(args.url, args=args)
     except KeyboardInterrupt:
-        sys.exit(1)
+        LOGGER.warning("Interrupted by user.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

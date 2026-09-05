@@ -1,63 +1,59 @@
-"""Main module of the project.
+"""Main entry point for the GoFile downloader.
 
-Usage:
-    Ensure that a file named 'URLs.txt' is present in the same directory as this script.
-    The file should contain a list of URLs, one per line. When executed, the script
-    will:
-        1. Read the URLs from 'URLs.txt'.
-        2. Process each URL for downloading anime content.
-        3. Clear the contents of 'URLs.txt' after all URLs have been processed.
+Reads URLs from URLs.txt and downloads them using plain CLI output.
+No GUI, Rich Live, terminal clearing, or interactive rendering is used.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
+from argparse import Namespace
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from downloader import handle_download_process
 from src.config import SESSION_LOG, URLS_FILE, parse_arguments
 from src.file_utils import read_file, write_file
-from src.general_utils import clear_terminal
-from src.managers.live_manager import initialize_managers
 
-if TYPE_CHECKING:
-    from argparse import Namespace
+LOGGER = logging.getLogger(__name__)
 
 URLS_FILE_PATH = Path.cwd() / URLS_FILE
 SESSION_FILE_PATH = Path.cwd() / SESSION_LOG
 
 
 def process_urls(urls: list[str], args: Namespace | None = None) -> None:
-    """Validate and downloads items for a list of URLs."""
-    live_manager = initialize_managers()
-
-    try:
-        with live_manager.live:
-            for url in urls:
-                handle_download_process(url, live_manager, args=args)
-
-            live_manager.stop()
-
-    except KeyboardInterrupt:
-        sys.exit(1)
+    """Download each URL sequentially."""
+    for index, url in enumerate(urls, start=1):
+        LOGGER.info("=" * 60)
+        LOGGER.info("[URL %d/%d] %s", index, len(urls), url)
+        LOGGER.info("=" * 60)
+        handle_download_process(url, args=args)
 
 
 def main() -> None:
-    """Run the script."""
-    # Clear the terminal and session log file
-    clear_terminal()
+    """Run the multi-URL downloader."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     write_file(SESSION_FILE_PATH)
 
-    # Parse arguments
     args = parse_arguments(common_only=True)
-
-    # Read and process URLs, ignoring empty lines
     urls = [url.strip() for url in read_file(URLS_FILE_PATH) if url.strip()]
-    process_urls(urls, args)
 
-    # Clear URLs file
-    write_file(URLS_FILE_PATH)
+    if not urls:
+        LOGGER.warning("[INFO] No URLs found in %s", URLS_FILE_PATH)
+        return
+
+    try:
+        process_urls(urls, args)
+    except KeyboardInterrupt:
+        LOGGER.warning("Interrupted by user.")
+        sys.exit(130)
+    finally:
+        write_file(URLS_FILE_PATH)
 
 
 if __name__ == "__main__":
